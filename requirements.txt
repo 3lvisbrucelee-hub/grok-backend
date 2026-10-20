@@ -1,4 +1,4 @@
-websockets
+flask
 requests
 base58
 cryptography
