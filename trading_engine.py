@@ -11,8 +11,6 @@ from solders.transaction import VersionedTransaction
 import base58
 
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
-SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
-solana_client = Client(SOLANA_RPC_URL)
 
 bot_keypair = None
 if SOLANA_PRIVATE_KEY:
@@ -22,9 +20,9 @@ if SOLANA_PRIVATE_KEY:
             bot_keypair = Keypair.from_bytes(key_bytes)
         else:
             bot_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
-        print(f"[SYSTEM] Wallet reale caricato: {bot_keypair.pubkey()}")
+        print(f"[SYSTEM] Wallet caricato con successo.")
     except Exception as e:
-        print(f"[ERROR] Errore caricamento chiave privata: {e}")
+        print(f"[ERROR] Errore chiave privata: {e}")
 
 connected_clients = set()
 
@@ -34,92 +32,67 @@ async def health_check(path, request_headers):
         return http.HTTPStatus.OK, [("Content-Type", "text/plain")], b"Grok Bot Backend is Alive!"
 
 async def execute_real_solana_buy():
-    """ Esegue un acquisto REALE On-Chain di $USDC tramite Jupiter DEX per 0.01 SOL """
     if not bot_keypair:
-        return "[ERROR] Nessuna chiave privata trovata su Render! Configura SOLANA_PRIVATE_KEY."
+        return "[ERROR] Chiave privata mancante su Render!"
 
     try:
         user_pubkey = str(bot_keypair.pubkey())
-        # Token Mints: SOL e USDC
         input_mint = "So11111111111111111111111111111111111111112"
-        output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" # USDC Mainnet
-        amount_lamports = 10000000  # 0.01 SOL per il test reale
+        output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" # USDC
+        amount_lamports = 10000000 # 0.01 SOL
 
-        # 1. Richiedi la Quote a Jupiter API
-        quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=100"
-        quote_res = requests.get(quote_url).json()
-
+        # Chiamata a Jupiter DEX API
+        quote_res = requests.get(f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=100").json()
         if "error" in quote_res:
-            return f"[ERROR] Errore Quote Jupiter: {quote_res.get('error')}"
+            return f"[ERROR] Jupiter Quote: {quote_res.get('error')}"
 
-        # 2. Richiedi la transazione da firmare a Jupiter
-        swap_url = "https://quote-api.jup.ag/v6/swap"
-        payload = {
+        swap_res = requests.post("https://quote-api.jup.ag/v6/swap", json={
             "quoteResponse": quote_res,
             "userPublicKey": user_pubkey,
             "wrapAndUnwrapSol": True
-        }
-        swap_res = requests.post(swap_url, json=payload).json()
-        swap_transaction_b64 = swap_res.get("swapTransaction")
+        }).json()
 
-        if not swap_transaction_b64:
-            return "[ERROR] Impossibile recuperare la transazione da Jupiter."
+        swap_tx_b64 = swap_res.get("swapTransaction")
+        if not swap_tx_b64:
+            return "[ERROR] Impossibile generare la transazione di swap."
 
-        # 3. Decodifica e Firma la Transazione con la tua Chiave Privata
-        raw_tx = base64.b64decode(swap_transaction_b64)
+        # Firma e invio
+        raw_tx = base64.b64decode(swap_tx_b64)
         tx = VersionedTransaction.from_bytes(raw_tx)
-
-        # Firma la transazione con la tua keypair
         signature = bot_keypair.sign_message(tx.message.to_bytes())
         signed_tx = VersionedTransaction.populate(tx.message, [signature])
 
-        # 4. Invia la transazione sulla Blockchain Solana
-        tx_hash = solana_client.send_raw_transaction(bytes(signed_tx)).value
-
-        return f"[SUCCESS] ACQUISTO REALE ESEGUITO! Tx Hash: {tx_hash}"
+        # Invio via RPC HTTP standard
+        rpc_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [base64.b64encode(bytes(signed_tx)).decode('utf-8'), {"encoding": "base64"}]
+        }
+        res = requests.post("https://api.mainnet-beta.solana.com", json=rpc_payload).json()
+        
+        if "result" in res:
+            return f"[SUCCESS] ACQUISTO REALE COMPLETATO! Tx: {res['result']}"
+        else:
+            return f"[ERROR] Rifiutato dalla rete: {res.get('error', 'Unknown')}"
 
     except Exception as e:
-        return f"[ERROR] Transazione fallita: {str(e)}"
-
-async def register(websocket):
-    connected_clients.add(websocket)
-    await websocket.send(json.dumps({
-        "type": "LOG",
-        "text": f"[SYSTEM] Connesso. Wallet di trading attivo: {bot_keypair.pubkey() if bot_keypair else 'Nessuno'}",
-        "category": "info"
-    }))
-
-async def unregister(websocket):
-    connected_clients.remove(websocket)
+        return f"[ERROR] Eccezione transazione: {str(e)}"
 
 async def handle_messages(websocket, path):
-    await register(websocket)
+    connected_clients.add(websocket)
     try:
         async for message in websocket:
             data = json.loads(message)
-            action = data.get("action")
-            
-            if action == "FORCE_BUY":
-                await websocket.send(json.dumps({
-                    "type": "LOG",
-                    "text": "[EXEC] Invio ordine di acquisto REALE a Jupiter DEX in corso...",
-                    "category": "exec"
-                }))
-                
-                # Esegue la transazione sulla blockchain
+            if data.get("action") == "FORCE_BUY":
+                await websocket.send(json.dumps({"type": "LOG", "text": "[EXEC] Invio ordine a Jupiter DEX...", "category": "exec"}))
                 result = await execute_real_solana_buy()
-                
                 category = "fill" if "[SUCCESS]" in result else "warn"
-                await websocket.send(json.dumps({
-                    "type": "LOG",
-                    "text": result,
-                    "category": category
-                }))
-
-    except websockets.exceptions.ConnectionClosed:
+                await websocket.send(json.dumps({"type": "LOG", "text": result, "category": category}))
+    except:
         pass
     finally:
-        await unregister(websocket)
+        connected_clients.remove(websocket)
 
 async def main():
     port = int(os.environ.get("PORT", 10000))
