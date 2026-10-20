@@ -71,7 +71,7 @@ def execute_trade():
         if not priv_key:
             return jsonify({"success": False, "message": "Chiave privata non configurata"}), 400
 
-        add_bot_log("[EXEC] Interrogazione Jupiter DEX su IP pulito...", "exec")
+        add_bot_log("[EXEC] Connessione diretta a Jupiter DEX...", "exec")
         
         try:
             input_mint = "So11111111111111111111111111111111111111112"  # SOL
@@ -83,7 +83,7 @@ def execute_trade():
                 "Accept": "application/json"
             }
 
-            # 1. Preventivo Jupiter con il nuovo IP pulito del server a pagamento
+            # 1. Preventivo Jupiter diretto
             quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=300"
             quote_resp = requests.get(quote_url, headers=headers, timeout=15)
             
@@ -110,7 +110,7 @@ def execute_trade():
             if not swap_tx_b64:
                 return jsonify({"success": False, "message": "Transazione di swap vuota."}), 400
 
-            # 3. Firma crittografica sicura Ed25519
+            # 3. Firma crittografica Ed25519
             tx_bytes = bytearray(base64.b64decode(swap_tx_b64))
             num_signatures = tx_bytes[0]
             msg_offset = 1 + (num_signatures * 64)
@@ -120,7 +120,7 @@ def execute_trade():
             tx_bytes[1:65] = signature
             signed_tx_b64 = base64.b64encode(bytes(tx_bytes)).decode('utf-8')
 
-            # 4. Invio transazione on-chain tramite Helius RPC
+            # 4. Invio transazione on-chain tramite il nodo RPC Helius
             rpc_payload = {
                 "jsonrpc": "2.0",
                 "id": 1,
