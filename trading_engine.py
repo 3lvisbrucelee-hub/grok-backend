@@ -1,45 +1,63 @@
 import os
 import json
-import base64
 import base58
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from cryptography.hazmat.primitives.asymmetric import ed25519
 import requests
 
 app = Flask(__name__)
-CORS(app)  # Abilita le richieste dal frontend Vercel
+CORS(app)
 
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 
-def get_bot_credentials():
+def get_pubkey():
     if not SOLANA_PRIVATE_KEY:
-        return None, None
+        return None
     try:
         if SOLANA_PRIVATE_KEY.startswith("["):
             key_bytes = bytes(json.loads(SOLANA_PRIVATE_KEY))[:32]
         else:
             key_bytes = base58.b58decode(SOLANA_PRIVATE_KEY)[:32]
-            
+        # Deriva la public key da base58 o ed25519
+        from cryptography.hazmat.primitives.asymmetric import ed25519
         private_key = ed25519.Ed25519PrivateKey.from_private_bytes(key_bytes)
         pub_bytes = private_key.public_key().public_bytes_raw()
-        pubkey_b58 = base58.b58encode(pub_bytes).decode('utf-8')
-        return private_key, pubkey_b58
+        return base58.b58encode(pub_bytes).decode('utf-8')
     except Exception as e:
-        print(f"[ERROR] Chiave privata non valida: {e}")
-        return None, None
+        print(f"[ERROR] Chiave: {e}")
+        return None
 
 @app.route("/", methods=["GET"])
 def health_check():
-    _, pubkey = get_bot_credentials()
-    status = "Online" if pubkey else "Online (Senza Chiave)"
-    return jsonify({"status": status, "wallet": pubkey}), 200
+    pubkey = get_pubkey()
+    return jsonify({"status": "Online", "wallet": pubkey}), 200
+
+@app.route("/api/balance", methods=["GET"])
+def get_balance():
+    pubkey = get_pubkey()
+    if not pubkey:
+        return jsonify({"success": False, "balance": 0.0}), 400
+    
+    try:
+        # Richiesta RPC ufficiale Solana via HTTP (senza blocchi CORS)
+        rpc_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBalance",
+            "params": [pubkey]
+        }
+        res = requests.post("https://api.mainnet-beta.solana.com", json=rpc_payload, timeout=5).json()
+        lamports = res.get("result", {}).get("value", 0)
+        sol_balance = lamports / 1e9
+        return jsonify({"success": True, "balance": sol_balance, "wallet": pubkey}), 200
+    except Exception as e:
+        return jsonify({"success": False, "balance": 0.0, "error": str(e)}), 500
 
 @app.route("/api/trade", methods=["POST"])
 def execute_trade():
-    private_key, pubkey_b58 = get_bot_credentials()
-    if not private_key or not pubkey_b58:
-        return jsonify({"success": False, "message": "Errore: Chiave privata non configurata su Render!"}), 400
+    pubkey = get_pubkey()
+    if not pubkey:
+        return jsonify({"success": False, "message": "Chiave privata non configurata su Render!"}), 400
 
     data = request.get_json() or {}
     action = data.get("action")
@@ -50,27 +68,30 @@ def execute_trade():
             output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" # USDC
             amount_lamports = 5000000  # 0.005 SOL
 
-            # 1. Preventivo Jupiter
             quote_res = requests.get(
                 f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=200",
                 timeout=10
             ).json()
             
             if "error" in quote_res:
-                return jsonify({"success": False, "message": f"Jupiter Quote Error: {quote_res.get('error')}"}), 400
+                return jsonify({"success": False, "message": f"Jupiter Error: {quote_res.get('error')}"}), 400
 
-            # 2. Transazione di Swap
             swap_res = requests.post("https://quote-api.jup.ag/v6/swap", json={
                 "quoteResponse": quote_res,
-                "userPublicKey": pubkey_b58,
+                "userPublicKey": pubkey,
                 "wrapAndUnwrapSol": True
             }, timeout=10).json()
 
             swap_tx_b64 = swap_res.get("swapTransaction")
             if not swap_tx_b64:
-                return jsonify({"success": False, "message": "Impossibile generare la transazione da Jupiter."}), 400
+                return jsonify({"success": False, "message": "Impossibile generare lo swap."}), 400
 
-            # 3. Firma crittografica
+            # Firma e invio standard
+            import base64
+            from cryptography.hazmat.primitives.asymmetric import ed25519
+            key_bytes = bytes(json.loads(SOLANA_PRIVATE_KEY))[:32] if SOLANA_PRIVATE_KEY.startswith("[") else base58.b58decode(SOLANA_PRIVATE_KEY)[:32]
+            private_key = ed25519.Ed25519PrivateKey.from_private_bytes(key_bytes)
+
             tx_bytes = bytearray(base64.b64decode(swap_tx_b64))
             num_signatures = tx_bytes[0]
             msg_offset = 1 + (num_signatures * 64)
@@ -80,7 +101,6 @@ def execute_trade():
             tx_bytes[1:65] = signature
             signed_tx_b64 = base64.b64encode(bytes(tx_bytes)).decode('utf-8')
 
-            # 4. Invio alla rete Solana
             rpc_payload = {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -96,7 +116,7 @@ def execute_trade():
                 return jsonify({"success": False, "message": f"Errore Solana: {err_msg}"}), 400
 
         except Exception as e:
-            return jsonify({"success": False, "message": f"Errore interno: {str(e)}"}), 500
+            return jsonify({"success": False, "message": f"Errore: {str(e)}"}), 500
 
     return jsonify({"success": False, "message": "Azione non riconosciuta"}), 400
 
