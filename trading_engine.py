@@ -71,40 +71,46 @@ def execute_trade():
         if not priv_key:
             return jsonify({"success": False, "message": "Chiave privata non configurata"}), 400
 
-        add_bot_log("[EXEC] Elaborazione ordine di acquisto...", "exec")
+        add_bot_log("[EXEC] Interrogazione Jupiter DEX su IP pulito...", "exec")
         
         try:
             input_mint = "So11111111111111111111111111111111111111112"  # SOL
             output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" # USDC
             amount_lamports = 5000000  # 0.005 SOL
 
-            # Utilizziamo un gateway proxy pubblico per evitare il blocco Cloudflare sull'IP di Render
-            proxy_url = f"https://api.allorigins.win/raw?url=https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=300"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json"
+            }
+
+            # 1. Preventivo Jupiter con il nuovo IP pulito del server a pagamento
+            quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=300"
+            quote_resp = requests.get(quote_url, headers=headers, timeout=15)
             
-            quote_resp = requests.get(proxy_url, timeout=15)
             if quote_resp.status_code != 200:
-                return jsonify({"success": False, "message": f"Errore proxy preventivo: {quote_resp.status_code}"}), 400
+                add_bot_log(f"[ERROR] Jupiter HTTP Error {quote_resp.status_code}", "warn")
+                return jsonify({"success": False, "message": f"Errore Jupiter HTTP {quote_resp.status_code}"}), 400
 
             quote_res = quote_resp.json()
             if "error" in quote_res:
                 return jsonify({"success": False, "message": f"Jupiter Error: {quote_res.get('error')}"}), 400
 
-            # Richiesta transazione di swap tramite Jupiter
+            # 2. Ottenimento transazione di swap
             swap_resp = requests.post("https://quote-api.jup.ag/v6/swap", json={
                 "quoteResponse": quote_res,
                 "userPublicKey": pubkey_b58,
                 "wrapAndUnwrapSol": True
-            }, headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"}, timeout=15)
+            }, headers=headers, timeout=15)
 
             if swap_resp.status_code != 200:
-                return jsonify({"success": False, "message": "Errore generazione swap Jupiter."}), 400
+                return jsonify({"success": False, "message": "Impossibile generare lo swap."}), 400
 
             swap_res = swap_resp.json()
             swap_tx_b64 = swap_res.get("swapTransaction")
             if not swap_tx_b64:
-                return jsonify({"success": False, "message": "Transazione di swap non valida."}), 400
+                return jsonify({"success": False, "message": "Transazione di swap vuota."}), 400
 
-            # Firma crittografica reale con la chiave del bot
+            # 3. Firma crittografica sicura Ed25519
             tx_bytes = bytearray(base64.b64decode(swap_tx_b64))
             num_signatures = tx_bytes[0]
             msg_offset = 1 + (num_signatures * 64)
@@ -114,7 +120,7 @@ def execute_trade():
             tx_bytes[1:65] = signature
             signed_tx_b64 = base64.b64encode(bytes(tx_bytes)).decode('utf-8')
 
-            # Invio transazione on-chain tramite il nodo RPC privato Helius
+            # 4. Invio transazione on-chain tramite Helius RPC
             rpc_payload = {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -126,7 +132,7 @@ def execute_trade():
             if "result" in rpc_resp:
                 tx_hash = rpc_resp["result"]
                 add_bot_log(f"[SUCCESS] ACQUISTO REALE COMPLETATO! Tx: {tx_hash[:16]}...", "fill")
-                return jsonify({"success": True, "message": f"Acquisto completato! Tx: {tx_hash[:12]}..."}), 200
+                return jsonify({"success": True, "message": f"Transazione completata! Tx: {tx_hash[:12]}..."}), 200
             else:
                 err_msg = rpc_resp.get("error", {}).get("message", "Rifiuto blockchain")
                 add_bot_log(f"[ERROR] Rete Solana: {err_msg}", "warn")
