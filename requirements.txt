@@ -2,5 +2,3 @@ websockets
 requests
 base58
 pynacl
-solana
-solders
