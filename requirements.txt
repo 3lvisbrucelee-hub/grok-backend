@@ -1,4 +1,4 @@
 websockets
 requests
 base58
-pynacl
+cryptography
