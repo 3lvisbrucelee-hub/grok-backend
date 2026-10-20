@@ -6,13 +6,14 @@ import base58
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 app = Flask(__name__)
 CORS(app)
 
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
-# Usa il nodo privato configurato su Render, con fallback al nodo pubblico
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 
 is_bot_running = True
@@ -25,6 +26,15 @@ def add_bot_log(msg, category="info"):
     last_logs.append(log_entry)
     if len(last_logs) > 30:
         last_logs.pop(0)
+
+# Configura una sessione HTTP con tentativi automatici (Retry) per superare i problemi DNS/rete
+def get_robust_session():
+    session = requests.Session()
+    retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504], raise_on_status=False)
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 def get_signer_and_pubkey():
     if not SOLANA_PRIVATE_KEY:
@@ -53,9 +63,10 @@ def get_balance():
     if not pubkey:
         return jsonify({"success": False, "balance": 0.0}), 400
     try:
-        res = requests.post(SOLANA_RPC_URL, json={
+        session = get_robust_session()
+        res = session.post(SOLANA_RPC_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pubkey]
-        }, timeout=5).json()
+        }, timeout=10).json()
         lamports = res.get("result", {}).get("value", 0)
         return jsonify({"success": True, "balance": lamports / 1e9, "wallet": pubkey, "logs": last_logs}), 200
     except Exception as e:
@@ -72,31 +83,36 @@ def execute_trade():
         if not priv_key:
             return jsonify({"success": False, "message": "Chiave privata non configurata"}), 400
 
-        add_bot_log("[EXEC] Richiesta preventivo a Jupiter DEX...", "exec")
+        add_bot_log("[EXEC] Connessione a Jupiter DEX con tentativi automatici...", "exec")
+        session = get_robust_session()
         
         try:
             input_mint = "So11111111111111111111111111111111111111112"  # SOL
             output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" # USDC
             amount_lamports = 5000000  # 0.005 SOL
 
-            # 1. Preventivo Jupiter
-            quote_res = requests.get(
-                f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=300",
-                timeout=10
-            ).json()
+            # 1. Preventivo Jupiter con sessione resiliente
+            quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=300"
+            quote_resp = session.get(quote_url, timeout=15)
+            
+            if quote_resp.status_code != 200:
+                add_bot_log(f"[ERROR] Jupiter HTTP Status {quote_resp.status_code}", "warn")
+                return jsonify({"success": False, "message": f"Errore HTTP Jupiter: {quote_resp.status_code}"}), 400
 
+            quote_res = quote_resp.json()
             if "error" in quote_res:
                 err_msg = quote_res.get('error')
                 add_bot_log(f"[ERROR] Jupiter Quote: {err_msg}", "warn")
                 return jsonify({"success": False, "message": f"Jupiter Error: {err_msg}"}), 400
 
             # 2. Transazione di swap
-            swap_res = requests.post("https://quote-api.jup.ag/v6/swap", json={
+            swap_resp = session.post("https://quote-api.jup.ag/v6/swap", json={
                 "quoteResponse": quote_res,
                 "userPublicKey": pubkey_b58,
                 "wrapAndUnwrapSol": True
-            }, timeout=10).json()
+            }, timeout=15)
 
+            swap_res = swap_resp.json()
             swap_tx_b64 = swap_res.get("swapTransaction")
             if not swap_tx_b64:
                 add_bot_log("[ERROR] Impossibile generare la transazione di swap da Jupiter", "warn")
@@ -119,21 +135,21 @@ def execute_trade():
                 "method": "sendTransaction",
                 "params": [signed_tx_b64, {"encoding": "base64", "skipPreflight": False, "maxRetries": 3}]
             }
-            rpc_res = requests.post(SOLANA_RPC_URL, json=rpc_payload, timeout=15).json()
+            rpc_resp = session.post(SOLANA_RPC_URL, json=rpc_payload, timeout=20).json()
 
-            if "result" in rpc_res:
-                tx_hash = rpc_res["result"]
+            if "result" in rpc_resp:
+                tx_hash = rpc_resp["result"]
                 add_bot_log(f"[SUCCESS] TX INVIATA! Hash: {tx_hash[:16]}...", "fill")
                 return jsonify({"success": True, "message": f"Acquisto reale eseguito! Tx: {tx_hash[:12]}..."}), 200
             else:
-                err_data = rpc_res.get("error", {})
+                err_data = rpc_resp.get("error", {})
                 err_msg = err_data.get("message", "Errore sconosciuto nodo RPC")
                 add_bot_log(f"[ERROR] Rifiuto blockchain: {err_msg}", "warn")
                 return jsonify({"success": False, "message": f"Errore blockchain: {err_msg}"}), 400
 
         except Exception as e:
-            add_bot_log(f"[CRITICAL] Eccezione: {str(e)}", "warn")
-            return jsonify({"success": False, "message": f"Errore critico: {str(e)}"}), 500
+            add_bot_log(f"[CRITICAL] Eccezione di rete: {str(e)}", "warn")
+            return jsonify({"success": False, "message": f"Errore di rete/DNS: {str(e)}"}), 500
 
     elif action == "TOGGLE_BOT":
         is_bot_running = not is_bot_running
