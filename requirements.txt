@@ -1,4 +1,6 @@
 websockets
 requests
-solders
 base58
+pynacl
+solana
+solders
