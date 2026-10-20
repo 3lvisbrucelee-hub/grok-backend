@@ -71,63 +71,40 @@ def execute_trade():
         if not priv_key:
             return jsonify({"success": False, "message": "Chiave privata non configurata"}), 400
 
-        add_bot_log("[EXEC] Interrogazione Jupiter DEX per swap reale...", "exec")
+        add_bot_log("[EXEC] Elaborazione ordine di acquisto...", "exec")
         
         try:
             input_mint = "So11111111111111111111111111111111111111112"  # SOL
             output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" # USDC
             amount_lamports = 5000000  # 0.005 SOL
 
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                "Accept": "application/json"
-            }
-
-            # Otteniamo l'IP diretto di Jupiter tramite Cloudflare DoH per evitare qualsiasi blocco DNS di Render
-            dns_res = requests.get(
-                "https://cloudflare-dns.com/dns-query?name=quote-api.jup.ag&type=A",
-                headers={"Accept": "application/json"},
-                timeout=5
-            ).json()
+            # Utilizziamo un gateway proxy pubblico per evitare il blocco Cloudflare sull'IP di Render
+            proxy_url = f"https://api.allorigins.win/raw?url=https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=300"
             
-            jup_ip = None
-            for ans in dns_res.get("Answer", []):
-                if ans.get("type") == 1:
-                    jup_ip = ans.get("data")
-                    break
-
-            if jup_ip:
-                quote_url = f"https://{jup_ip}/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=300"
-                headers["Host"] = "quote-api.jup.ag"
-            else:
-                quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=300"
-
-            quote_resp = requests.get(quote_url, headers=headers, timeout=15, verify=False)
+            quote_resp = requests.get(proxy_url, timeout=15)
             if quote_resp.status_code != 200:
-                return jsonify({"success": False, "message": f"Errore Jupiter Quote HTTP {quote_resp.status_code}"}), 400
+                return jsonify({"success": False, "message": f"Errore proxy preventivo: {quote_resp.status_code}"}), 400
 
             quote_res = quote_resp.json()
             if "error" in quote_res:
                 return jsonify({"success": False, "message": f"Jupiter Error: {quote_res.get('error')}"}), 400
 
-            # Richiesta transazione di swap
-            if jup_ip:
-                swap_url = f"https://{jup_ip}/v6/swap"
-            else:
-                swap_url = "https://quote-api.jup.ag/v6/swap"
-
-            swap_resp = requests.post(swap_url, json={
+            # Richiesta transazione di swap tramite Jupiter
+            swap_resp = requests.post("https://quote-api.jup.ag/v6/swap", json={
                 "quoteResponse": quote_res,
                 "userPublicKey": pubkey_b58,
                 "wrapAndUnwrapSol": True
-            }, headers=headers, timeout=15, verify=False)
+            }, headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"}, timeout=15)
+
+            if swap_resp.status_code != 200:
+                return jsonify({"success": False, "message": "Errore generazione swap Jupiter."}), 400
 
             swap_res = swap_resp.json()
             swap_tx_b64 = swap_res.get("swapTransaction")
             if not swap_tx_b64:
-                return jsonify({"success": False, "message": "Impossibile generare lo swap da Jupiter."}), 400
+                return jsonify({"success": False, "message": "Transazione di swap non valida."}), 400
 
-            # Firma crittografica della transazione reale
+            # Firma crittografica reale con la chiave del bot
             tx_bytes = bytearray(base64.b64decode(swap_tx_b64))
             num_signatures = tx_bytes[0]
             msg_offset = 1 + (num_signatures * 64)
@@ -137,7 +114,7 @@ def execute_trade():
             tx_bytes[1:65] = signature
             signed_tx_b64 = base64.b64encode(bytes(tx_bytes)).decode('utf-8')
 
-            # Invio transazione firmata tramite Helius RPC
+            # Invio transazione on-chain tramite il nodo RPC privato Helius
             rpc_payload = {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -148,8 +125,8 @@ def execute_trade():
 
             if "result" in rpc_resp:
                 tx_hash = rpc_resp["result"]
-                add_bot_log(f"[SUCCESS] SWAP REALE ESEGUITO! Tx: {tx_hash[:16]}...", "fill")
-                return jsonify({"success": True, "message": f"Acquisto reale completato! Tx: {tx_hash[:12]}..."}), 200
+                add_bot_log(f"[SUCCESS] ACQUISTO REALE COMPLETATO! Tx: {tx_hash[:16]}...", "fill")
+                return jsonify({"success": True, "message": f"Acquisto completato! Tx: {tx_hash[:12]}..."}), 200
             else:
                 err_msg = rpc_resp.get("error", {}).get("message", "Rifiuto blockchain")
                 add_bot_log(f"[ERROR] Rete Solana: {err_msg}", "warn")
