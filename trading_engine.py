@@ -52,10 +52,9 @@ def get_balance():
     if not pubkey:
         return jsonify({"success": False, "balance": 0.0}), 400
     try:
-        headers = {"Content-Type": "application/json"}
         res = requests.post(SOLANA_RPC_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pubkey]
-        }, headers=headers, timeout=10).json()
+        }, timeout=10).json()
         lamports = res.get("result", {}).get("value", 0)
         return jsonify({"success": True, "balance": lamports / 1e9, "wallet": pubkey, "logs": last_logs}), 200
     except Exception as e:
@@ -72,7 +71,7 @@ def execute_trade():
         if not priv_key:
             return jsonify({"success": False, "message": "Chiave privata non configurata"}), 400
 
-        add_bot_log("[EXEC] Connessione a Jupiter API...", "exec")
+        add_bot_log("[EXEC] Bypass DNS e connessione a Jupiter DEX...", "exec")
         
         try:
             input_mint = "So11111111111111111111111111111111111111112"  # SOL
@@ -80,16 +79,34 @@ def execute_trade():
             amount_lamports = 5000000  # 0.005 SOL
 
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "User-Agent": "Mozilla/5.0",
                 "Accept": "application/json"
             }
 
-            # 1. Preventivo Jupiter con intestazioni HTTP complete
-            quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=300"
-            quote_resp = requests.get(quote_url, headers=headers, timeout=15)
+            # Risoluzione DNS tramite Cloudflare DoH per evitare blocchi DNS di Render
+            dns_res = requests.get(
+                "https://cloudflare-dns.com/dns-query?name=quote-api.jup.ag&type=A",
+                headers={"Accept": "application/json"},
+                timeout=5
+            ).json()
+            
+            jup_ip = None
+            for ans in dns_res.get("Answer", []):
+                if ans.get("type") == 1:
+                    jup_ip = ans.get("data")
+                    break
+
+            if jup_ip:
+                # Connessione forzata via IP con Host header
+                quote_url = f"https://{jup_ip}/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=300"
+                headers["Host"] = "quote-api.jup.ag"
+            else:
+                quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=300"
+
+            quote_resp = requests.get(quote_url, headers=headers, timeout=15, verify=False)
             
             if quote_resp.status_code != 200:
-                add_bot_log(f"[ERROR] Jupiter risponde con codice {quote_resp.status_code}", "warn")
+                add_bot_log(f"[ERROR] Jupiter HTTP Status {quote_resp.status_code}", "warn")
                 return jsonify({"success": False, "message": f"Errore Jupiter HTTP {quote_resp.status_code}"}), 400
 
             quote_res = quote_resp.json()
@@ -99,16 +116,21 @@ def execute_trade():
                 return jsonify({"success": False, "message": f"Jupiter Error: {err_msg}"}), 400
 
             # 2. Transazione di swap
-            swap_resp = requests.post("https://quote-api.jup.ag/v6/swap", json={
+            if jup_ip:
+                swap_url = f"https://{jup_ip}/v6/swap"
+            else:
+                swap_url = "https://quote-api.jup.ag/v6/swap"
+
+            swap_resp = requests.post(swap_url, json={
                 "quoteResponse": quote_res,
                 "userPublicKey": pubkey_b58,
                 "wrapAndUnwrapSol": True
-            }, headers=headers, timeout=15)
+            }, headers=headers, timeout=15, verify=False)
 
             swap_res = swap_resp.json()
             swap_tx_b64 = swap_res.get("swapTransaction")
             if not swap_tx_b64:
-                add_bot_log("[ERROR] Impossibile generare lo swap.", "warn")
+                add_bot_log("[ERROR] Impossibile generare lo swap da Jupiter", "warn")
                 return jsonify({"success": False, "message": "Impossibile generare lo swap."}), 400
 
             # 3. Firma crittografica
@@ -141,8 +163,8 @@ def execute_trade():
                 return jsonify({"success": False, "message": f"Errore blockchain: {err_msg}"}), 400
 
         except Exception as e:
-            add_bot_log(f"[CRITICAL] Errore connessione: {str(e)}", "warn")
-            return jsonify({"success": False, "message": f"Errore DNS/Connessione: {str(e)}"}), 500
+            add_bot_log(f"[CRITICAL] Errore: {str(e)}", "warn")
+            return jsonify({"success": False, "message": f"Errore: {str(e)}"}), 500
 
     elif action == "TOGGLE_BOT":
         is_bot_running = not is_bot_running
