@@ -1,12 +1,14 @@
 import os
 import json
 import time
-import base64
 import base58
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.system_program import transfer, TransferParams
+from solders.transaction import Transaction
 import requests
-from cryptography.hazmat.primitives.asymmetric import ed25519
 
 app = Flask(__name__)
 CORS(app)
@@ -26,32 +28,30 @@ def add_bot_log(msg, category="info"):
     if len(last_logs) > 40:
         last_logs.pop(0)
 
-def get_signer_and_pubkey():
+def get_keypair():
     if not SOLANA_PRIVATE_KEY:
-        return None, None
+        return None
     try:
         if SOLANA_PRIVATE_KEY.startswith("["):
-            key_bytes = bytes(json.loads(SOLANA_PRIVATE_KEY))[:32]
+            key_bytes = bytes(json.loads(SOLANA_PRIVATE_KEY))
         else:
-            key_bytes = base58.b58decode(SOLANA_PRIVATE_KEY)[:32]
-            
-        priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(key_bytes)
-        pub_bytes = priv_key.public_key().public_bytes_raw()
-        pubkey_b58 = base58.b58encode(pub_bytes).decode('utf-8')
-        return priv_key, pubkey_b58
+            key_bytes = base58.b58decode(SOLANA_PRIVATE_KEY)
+        return Keypair.from_bytes(key_bytes)
     except Exception as e:
-        return None, None
+        return None
 
 @app.route("/", methods=["GET"])
 def health_check():
-    _, pubkey = get_signer_and_pubkey()
-    return jsonify({"status": "Online Real On-Chain Engine", "wallet": pubkey}), 200
+    kp = get_keypair()
+    pubkey = str(kp.pubkey()) if kp else None
+    return jsonify({"status": "Online Solders Engine", "wallet": pubkey}), 200
 
 @app.route("/api/balance", methods=["GET"])
 def get_balance():
-    _, pubkey = get_signer_and_pubkey()
-    if not pubkey:
+    kp = get_keypair()
+    if not kp:
         return jsonify({"success": False, "balance": 0.0}), 400
+    pubkey = str(kp.pubkey())
     try:
         res = requests.post(SOLANA_RPC_URL, json={
             "jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [pubkey]
@@ -80,54 +80,84 @@ def execute_trade():
     action = data.get("action")
 
     if action == "FORCE_BUY":
-        priv_key, pubkey_b58 = get_signer_and_pubkey()
-        if not priv_key:
-            return jsonify({"success": False, "message": "Chiave privata non configurata su Render"}), 400
+        kp = get_keypair()
+        if not kp:
+            return jsonify({"success": False, "message": "Chiave privata non valida"}), 400
 
-        add_bot_log("[EXEC] Connessione al nodo Helius per transazione reale...", "exec")
+        add_bot_log("[EXEC] Creazione transazione reale on-chain via Solders...", "exec")
         
         try:
-            # 1. Otteniamo il blockhash recente da Helius
-            bh_payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getLatestBlockhash",
-                "params": [{"commitment": "finalized"}]
-            }
-            bh_resp = requests.post(SOLANA_RPC_URL, json=bh_payload, timeout=10).json()
-            blockhash = bh_resp.get("result", {}).get("value", {}).get("blockhash")
+            sender_pubkey = kp.pubkey()
             
-            if not blockhash:
-                add_bot_log("[ERROR] Impossibile recuperare il blockhash da Helius", "warn")
+            # 1. Recupero blockhash recente da Helius
+            bh_resp = requests.post(SOLANA_RPC_URL, json={
+                "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash", "params": [{"commitment": "finalized"}]
+            }, timeout=10).json()
+            
+            blockhash_str = bh_resp.get("result", {}).get("value", {}).get("blockhash")
+            if not blockhash_str:
                 return jsonify({"success": False, "message": "Errore blocco Helius"}), 400
 
-            add_bot_log(f"[INFO] Wallet mittente verificato: {pubkey_b58[:8]}...", "info")
-            
-            # NOTA: Per eseguire uno scambio reale di memecoin senza passare per i domini bloccati di Jupiter,
-            # effettuiamo una transazione di interazione firmata e trasmessa direttamente via Helius RPC.
-            
-            # Registrazione della posizione reale attiva per la Dashboard
-            new_position = {
-                "id": f"TX_{int(time.time())}",
-                "token": "SOL/MEME",
-                "amount": "0.005 SOL",
-                "buy_price": "Mercato Reale",
-                "pnl": "+0.00 SOL",
-                "status": "ATTIVA (On-Chain)",
-                "time": time.strftime("%H:%M:%S")
-            }
-            active_positions.append(new_position)
+            from solders.hash import Hash
+            recent_blockhash = Hash.from_string(blockhash_str)
 
-            add_bot_log("[SUCCESS] Transazione firmata ed eseguita sul nodo Helius!", "fill")
-            return jsonify({
-                "success": True, 
-                "message": "Transazione eseguita sul wallet!",
-                "position": new_position
-            }), 200
+            # 2. Eseguiamo una micro-transazione reale (es. invio di test a te stesso o a un pool)
+            # Per testare l'uscita reale dei fondi, inviamo 0.001 SOL al tuo stesso indirizzo o a un DEX
+            lamports_to_send = 1000000  # 0.001 SOL
+            transfer_instruction = transfer(
+                TransferParams(
+                    from_pubkey=sender_pubkey,
+                    to_pubkey=sender_pubkey,  # Spostamento/Test sul wallet stesso
+                    lamports=lamports_to_send
+                )
+            )
+
+            # 3. Compilazione e firma crittografica della transazione
+            tx = Transaction.new_signed_with_payer(
+                [transfer_instruction],
+                sender_pubkey,
+                [kp],
+                recent_blockhash
+            )
+
+            # 4. Invio tramite Helius RPC
+            tx_bytes = bytes(tx)
+            tx_base64 = base58.b58encode(tx_bytes).decode('utf-8') # oppure base64
+
+            import base64
+            tx_base64 = base64.b64encode(tx_bytes).decode('utf-8')
+
+            rpc_payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "sendTransaction",
+                "params": [tx_base64, {"encoding": "base64", "skipPreflight": False}]
+            }
+            
+            rpc_resp = requests.post(SOLANA_RPC_URL, json=rpc_payload, headers={"Content-Type": "application/json"}, timeout=20).json()
+
+            if "result" in rpc_resp:
+                tx_hash = rpc_resp["result"]
+                add_bot_log(f"[SUCCESS] TRANSAZIONE REALE INVIATA! Tx: {tx_hash[:12]}...", "fill")
+                
+                new_pos = {
+                    "id": tx_hash[:8],
+                    "token": "SOL TRANSFER",
+                    "amount": "0.001 SOL",
+                    "status": "COMPLETATA ON-CHAIN",
+                    "time": time.strftime("%H:%M:%S")
+                }
+                active_positions.append(new_pos)
+
+                return jsonify({"success": True, "message": f"Transazione reale eseguita! Tx: {tx_hash[:8]}..."}), 200
+            else:
+                err_msg = rpc_resp.get("error", {}).get("message", "Errore rete")
+                add_bot_log(f"[ERROR] Rifiuto blockchain: {err_msg}", "warn")
+                return jsonify({"success": False, "message": fエラー: {err_msg}"}), 400
 
         except Exception as e:
-            add_bot_log(f"[CRITICAL] Errore critico on-chain: {str(e)}", "warn")
-            return jsonify({"success": False, "message": f"Errore: {str(e)}"}), 500
+            add_bot_log(f"[CRITICAL] {str(e)}", "warn")
+            return jsonify({"success": False, "message": str(e)}), 500
 
     elif action == "TOGGLE_BOT":
         is_bot_running = not is_bot_running
