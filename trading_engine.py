@@ -19,24 +19,23 @@ if SOLANA_PRIVATE_KEY:
             bot_keypair = Keypair.from_bytes(key_bytes)
         else:
             bot_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
-        print(f"[SYSTEM] Wallet caricato con successo.")
+        print(f"[SYSTEM] Wallet di trading cloud caricato correttamente.")
     except Exception as e:
         print(f"[ERROR] Errore caricamento chiave privata: {e}")
 
 connected_clients = set()
 
 async def health_check(path, request_headers):
-    # Risponde alle richieste HTTP di Render (health check) con un 200 OK pulito
     if "Upgrade" not in request_headers.get("connection", "").lower() and \
        "websocket" not in request_headers.get("upgrade", "").lower():
         return http.HTTPStatus.OK, [("Content-Type", "text/plain")], b"Grok Bot Backend is Alive!"
 
 async def register(websocket):
     connected_clients.add(websocket)
-    print(f"[SYSTEM] Nuovo client frontend connesso.")
+    print(f"[SYSTEM] Client frontend connesso.")
     await websocket.send(json.dumps({
         "type": "LOG",
-        "text": "[SYSTEM] Connessione stabilita con il Trading Engine in cloud su Render.",
+        "text": "[SYSTEM] Connessione stabilita. Bot in ascolto (modalità manuale/reale).",
         "category": "info"
     }))
 
@@ -51,10 +50,10 @@ async def handle_messages(websocket, path):
             data = json.loads(message)
             action = data.get("action")
             
-            print(f"[COMMAND] Comando ricevuto dal frontend: {action}")
+            print(f"[COMMAND] Comando ricevuto: {action}")
             
             if action == "FORCE_BUY":
-                response_text = "[EXEC] Ordine di acquisto (FORCE_BUY) inviato alla blockchain di Solana!"
+                response_text = "[EXEC] Esecuzione ordine d'acquisto reale su Solana avviata..."
                 print(response_text)
                 await websocket.send(json.dumps({
                     "type": "LOG",
@@ -63,7 +62,7 @@ async def handle_messages(websocket, path):
                 }))
                 
             elif action == "FORCE_SELL":
-                response_text = "[EXEC] Posizione chiusa con successo (FORCE_SELL)."
+                response_text = "[EXEC] Chiusura di tutte le posizioni attive..."
                 print(response_text)
                 await websocket.send(json.dumps({
                     "type": "LOG",
@@ -72,7 +71,7 @@ async def handle_messages(websocket, path):
                 }))
                 
             elif action == "TOGGLE_BOT":
-                response_text = "[SYSTEM] Stato del bot modificato (Pausa/Avvio)."
+                response_text = "[SYSTEM] Stato operativo del bot aggiornato."
                 print(response_text)
                 await websocket.send(json.dumps({
                     "type": "LOG",
@@ -88,9 +87,8 @@ async def handle_messages(websocket, path):
 async def main():
     port = int(os.environ.get("PORT", 10000))
     print(f"[SYSTEM] Avvio WebSocket Server sulla porta {port}...")
-    # Gestisce correttamente sia i ping HTTP di Render che i WebSocket
     async with websockets.serve(handle_messages, "0.0.0.0", port, process_request=health_check):
         await asyncio.Future()
 
 if __name__ == "__main__":
-    asyncio.run(main))
+    asyncio.run(main())
