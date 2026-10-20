@@ -47,14 +47,27 @@ def execute_real_jupiter_swap(input_mint, output_mint, amount_lamports):
     if not priv_key or not pubkey_b58:
         return False, "Chiave privata non configurata su Render"
 
-    try:
-        # 1. Quote Jupiter
-        quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=300"
-        quote_res = requests.get(quote_url, timeout=8).json()
-        if "error" in quote_res:
-            return False, f"Jupiter Quote: {quote_res.get('error')}"
+    # Usa i nuovi endpoint pubblici v1 di Jupiter / Raydium Swap Router
+    endpoints = [
+        f"https://lite.jup.ag/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=300",
+        f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=300"
+    ]
 
-        # 2. Transazione Swap
+    quote_res = None
+    for url in endpoints:
+        try:
+            res = requests.get(url, timeout=5)
+            if res.status_code == 200:
+                quote_res = res.json()
+                if "error" not in quote_res:
+                    break
+        except Exception:
+            continue
+
+    if not quote_res or "error" in quote_res:
+        return False, "API Swap temporaneamente non raggiungibile, riprovo al prossimo ciclo"
+
+    try:
         swap_res = requests.post("https://quote-api.jup.ag/v6/swap", json={
             "quoteResponse": quote_res,
             "userPublicKey": pubkey_b58,
@@ -63,9 +76,8 @@ def execute_real_jupiter_swap(input_mint, output_mint, amount_lamports):
 
         swap_tx_b64 = swap_res.get("swapTransaction")
         if not swap_tx_b64:
-            return False, "Impossibile ottenere transazione da Jupiter"
+            return False, "Impossibile generare payload transazione"
 
-        # 3. Firma Ed25519
         tx_bytes = bytearray(base64.b64decode(swap_tx_b64))
         num_signatures = tx_bytes[0]
         msg_offset = 1 + (num_signatures * 64)
@@ -75,7 +87,6 @@ def execute_real_jupiter_swap(input_mint, output_mint, amount_lamports):
         tx_bytes[1:65] = signature
         signed_tx_b64 = base64.b64encode(bytes(tx_bytes)).decode('utf-8')
 
-        # 4. Invio a Solana RPC
         rpc_payload = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -87,14 +98,13 @@ def execute_real_jupiter_swap(input_mint, output_mint, amount_lamports):
         if "result" in rpc_res:
             return True, rpc_res["result"]
         else:
-            return False, rpc_res.get("error", {}).get("message", "Rifiutato dalla rete")
+            return False, rpc_res.get("error", {}).get("message", "Rifiutato dalla rete Solana")
             
     except Exception as e:
         return False, str(e)
 
 def autonomous_trading_loop():
-    """ Ciclo automatico che gira in background su Render """
-    add_bot_log("[SYSTEM] Motore autonomo avviato in background...", "info")
+    add_bot_log("[SYSTEM] Motore autonomo di trading attivo su Render 24/7...", "info")
     SOL_MINT = "So11111111111111111111111111111111111111112"
     USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
@@ -102,20 +112,17 @@ def autonomous_trading_loop():
         try:
             if is_bot_running:
                 add_bot_log("[SCAN] Scansione nuovi token ed opportunità su Raydium/Jupiter...", "exec")
-                
-                # Esegue un piccolo test/acquisto reale (0.005 SOL)
                 success, tx_or_err = execute_real_jupiter_swap(SOL_MINT, USDC_MINT, 5000000)
                 if success:
-                    add_bot_log(f"[SUCCESS] ACQUISTO AUTOMATICO REALE! Tx: {tx_or_err[:12]}...", "fill")
+                    add_bot_log(f"[SUCCESS] ACQUISTO AUTOMATICO ESEGUITO! Tx: {tx_or_err[:12]}...", "fill")
                 else:
-                    add_bot_log(f"[BOT] Scansione completata. Esito ordine: {tx_or_err}", "warn")
+                    add_bot_log(f"[BOT] Scansione completata. Esito: {tx_or_err}", "warn")
             
-            time.sleep(30) # Scansiona/esegue ogni 30 secondi
+            time.sleep(25)
         except Exception as e:
-            add_bot_log(f"[ERROR] Eccezione loop: {e}", "warn")
+            add_bot_log(f"[ERROR] Errore loop: {e}", "warn")
             time.sleep(10)
 
-# Avvio del ciclo autonomo in un thread separato
 threading.Thread(target=autonomous_trading_loop, daemon=True).start()
 
 @app.route("/", methods=["GET"])
@@ -149,7 +156,7 @@ def execute_trade():
         if success:
             return jsonify({"success": True, "message": f"[SUCCESS] Acquisto Reale Eseguito! Tx: {res}"}), 200
         else:
-            return jsonify({"success": False, "message": f"Errore: {res}"}), 400
+            return jsonify({"success": False, "message": f"Esito: {res}"}), 200
 
     elif action == "TOGGLE_BOT":
         is_bot_running = not is_bot_running
