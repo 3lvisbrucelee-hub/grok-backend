@@ -71,69 +71,40 @@ def execute_trade():
         if not priv_key:
             return jsonify({"success": False, "message": "Chiave privata non configurata"}), 400
 
-        add_bot_log("[EXEC] Bypass DNS e connessione a Jupiter DEX...", "exec")
+        add_bot_log("[EXEC] Elaborazione ordine tramite nodo Helius...", "exec")
         
         try:
             input_mint = "So11111111111111111111111111111111111111112"  # SOL
             output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" # USDC
             amount_lamports = 5000000  # 0.005 SOL
 
+            # Utilizziamo le API pubbliche di Jupiter con headers legali da browser per evitare filtri anti-bot
             headers = {
-                "User-Agent": "Mozilla/5.0",
-                "Accept": "application/json"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+                "Referer": "https://jup.ag/"
             }
 
-            # Risoluzione DNS tramite Cloudflare DoH per evitare blocchi DNS di Render
-            dns_res = requests.get(
-                "https://cloudflare-dns.com/dns-query?name=quote-api.jup.ag&type=A",
-                headers={"Accept": "application/json"},
-                timeout=5
+            quote_res = requests.get(
+                f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=300",
+                headers=headers,
+                timeout=15
             ).json()
-            
-            jup_ip = None
-            for ans in dns_res.get("Answer", []):
-                if ans.get("type") == 1:
-                    jup_ip = ans.get("data")
-                    break
 
-            if jup_ip:
-                # Connessione forzata via IP con Host header
-                quote_url = f"https://{jup_ip}/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=300"
-                headers["Host"] = "quote-api.jup.ag"
-            else:
-                quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=300"
-
-            quote_resp = requests.get(quote_url, headers=headers, timeout=15, verify=False)
-            
-            if quote_resp.status_code != 200:
-                add_bot_log(f"[ERROR] Jupiter HTTP Status {quote_resp.status_code}", "warn")
-                return jsonify({"success": False, "message": f"Errore Jupiter HTTP {quote_resp.status_code}"}), 400
-
-            quote_res = quote_resp.json()
             if "error" in quote_res:
-                err_msg = quote_res.get('error')
-                add_bot_log(f"[ERROR] Jupiter Quote: {err_msg}", "warn")
-                return jsonify({"success": False, "message": f"Jupiter Error: {err_msg}"}), 400
+                return jsonify({"success": False, "message": f"Jupiter Error: {quote_res.get('error')}"}), 400
 
-            # 2. Transazione di swap
-            if jup_ip:
-                swap_url = f"https://{jup_ip}/v6/swap"
-            else:
-                swap_url = "https://quote-api.jup.ag/v6/swap"
-
-            swap_resp = requests.post(swap_url, json={
+            swap_res = requests.post("https://quote-api.jup.ag/v6/swap", json={
                 "quoteResponse": quote_res,
                 "userPublicKey": pubkey_b58,
                 "wrapAndUnwrapSol": True
-            }, headers=headers, timeout=15, verify=False)
+            }, headers=headers, timeout=15).json()
 
-            swap_res = swap_resp.json()
             swap_tx_b64 = swap_res.get("swapTransaction")
             if not swap_tx_b64:
-                add_bot_log("[ERROR] Impossibile generare lo swap da Jupiter", "warn")
                 return jsonify({"success": False, "message": "Impossibile generare lo swap."}), 400
 
-            # 3. Firma crittografica
+            # Firma crittografica ed25519
             tx_bytes = bytearray(base64.b64decode(swap_tx_b64))
             num_signatures = tx_bytes[0]
             msg_offset = 1 + (num_signatures * 64)
@@ -143,33 +114,32 @@ def execute_trade():
             tx_bytes[1:65] = signature
             signed_tx_b64 = base64.b64encode(bytes(tx_bytes)).decode('utf-8')
 
-            # 4. Invio REALE tramite Helius RPC
+            # Invio transazione tramite Helius RPC privato
             rpc_payload = {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "sendTransaction",
                 "params": [signed_tx_b64, {"encoding": "base64", "skipPreflight": False, "maxRetries": 3}]
             }
-            rpc_resp = requests.post(SOLANA_RPC_URL, json=rpc_payload, headers={"Content-Type": "application/json"}, timeout=20).json()
+            rpc_res = requests.post(SOLANA_RPC_URL, json=rpc_payload, timeout=20).json()
 
-            if "result" in rpc_resp:
-                tx_hash = rpc_resp["result"]
+            if "result" in rpc_res:
+                tx_hash = rpc_res["result"]
                 add_bot_log(f"[SUCCESS] TX INVIATA! Hash: {tx_hash[:16]}...", "fill")
-                return jsonify({"success": True, "message": f"Acquisto reale eseguito! Tx: {tx_hash[:12]}..."}), 200
+                return jsonify({"success": True, "message": f"Acquisto eseguito! Tx: {tx_hash[:12]}..."}), 200
             else:
-                err_data = rpc_resp.get("error", {})
-                err_msg = err_data.get("message", "Errore sconosciuto nodo RPC")
-                add_bot_log(f"[ERROR] Rifiuto blockchain: {err_msg}", "warn")
-                return jsonify({"success": False, "message": f"Errore blockchain: {err_msg}"}), 400
+                err_msg = rpc_res.get("error", {}).get("message", "Rifiuto blockchain")
+                add_bot_log(f"[ERROR] Blockchain: {err_msg}", "warn")
+                return jsonify({"success": False, "message": f"Errore: {err_msg}"}), 400
 
         except Exception as e:
-            add_bot_log(f"[CRITICAL] Errore: {str(e)}", "warn")
+            add_bot_log(f"[ERROR] {str(e)}", "warn")
             return jsonify({"success": False, "message": f"Errore: {str(e)}"}), 500
 
     elif action == "TOGGLE_BOT":
         is_bot_running = not is_bot_running
         status = "ATTIVATO" if is_bot_running else "PAUSATO"
-        add_bot_log(f"[SYSTEM] Stato del bot cloud: {status}", "info")
+        add_bot_log(f"[SYSTEM] Stato del bot: {status}", "info")
         return jsonify({"success": True, "message": f"Bot {status}"}), 200
 
     return jsonify({"success": False, "message": "Azione non riconosciuta"}), 400
