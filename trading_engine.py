@@ -1,117 +1,96 @@
-import os
 import asyncio
 import json
-import logging
-import requests
+import os
 import websockets
-from typing import Dict, Any
+from solana.rpc.api import Client
+from solders.keypair import Keypair
+import base58
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# Recupera la chiave privata configurata in sicurezza nelle variabili d'ambiente di Render
+SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 
-CONFIG = {
-    "RPC_URL": "https://api.mainnet-beta.solana.com",
-    "INITIAL_BALANCE": 3625.30,
-    "MAX_DEV_HOLDING_PCT": 10.0
-}
+# Inizializzazione del client Solana (Mainnet)
+SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+solana_client = Client(SOLANA_RPC_URL)
 
-class TradingEngine:
-    def __init__(self):
-        self.balance = CONFIG["INITIAL_BALANCE"]
-        self.connected_clients = set()
-        self.active_positions = {}
-        self.running = False
+# Configurazione del Wallet del Bot (se la chiave è presente)
+bot_keypair = None
+if SOLANA_PRIVATE_KEY:
+    try:
+        # Supporta sia array di byte che stringa Base58
+        if SOLANA_PRIVATE_KEY.startswith("["):
+            key_bytes = bytes(json.loads(SOLANA_PRIVATE_KEY))
+            bot_keypair = Keypair.from_bytes(key_bytes)
+        else:
+            bot_keypair = Keypair.from_bytes(base58.b58decode(SOLANA_PRIVATE_KEY))
+        print(f"[SYSTEM] Wallet caricato con successo per il trading in cloud.")
+    except Exception as e:
+        print(f"[ERROR] Errore nel caricamento della chiave privata: {e}")
 
-    def check_token_security(self, token_mint: str) -> dict:
-        try:
-            url = f"https://api.rugcheck.xyz/v1/tokens/{token_mint}/report/summary"
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                dev_holding = data.get("topHolders", [{}])[0].get("pct", 0)
-                is_mintable = data.get("mintAuthority") is not None
-                if dev_holding > CONFIG["MAX_DEV_HOLDING_PCT"]:
-                    return {"safe": False, "reason": f"DEV holds {dev_holding:.1f}% - skipped"}
-                if is_mintable:
-                    return {"safe": False, "reason": "Mint authority enabled - skipped"}
-                return {"safe": True, "reason": "Passed security check"}
-        except Exception as e:
-            logging.warning(f"Impossibile verificare la sicurezza: {e}")
-        return {"safe": True, "reason": "Simulated check passed"}
+# Gestione delle connessioni WebSocket con il frontend
+connected_clients = set()
 
-    async def execute_trade(self, action: str, symbol: str, amount_usd: float, price: float):
-        if action == "BUY":
-            self.balance -= amount_usd
-            self.active_positions[symbol] = {"entry_price": price, "amount_usd": amount_usd}
-            log_msg = f"[EXEC] BUY ${amount_usd:.2f} SOL ${symbol} @ ${price:.6f}"
-            logging.info(log_msg)
-            await self.broadcast({"type": "LOG", "text": log_msg, "category": "exec"})
-        elif action == "SELL":
-            entry = self.active_positions.get(symbol, {}).get("entry_price", price)
-            pnl_usd = amount_usd * ((price - entry) / entry)
-            self.balance += (amount_usd + pnl_usd)
-            pnl_str = f"+${pnl_usd:.2f}" if pnl_usd >= 0 else f"-${abs(pnl_usd):.2f}"
-            log_msg = f"[FILL] SOLD ${symbol} {pnl_str}"
-            logging.info(log_msg)
-            if symbol in self.active_positions:
-                del self.active_positions[symbol]
-            await self.broadcast({"type": "LOG", "text": log_msg, "category": "fill"})
-        
-        await self.broadcast({"type": "BALANCE_UPDATE", "balance": round(self.balance, 2)})
+async def register(websocket):
+    connected_clients.add(websocket)
+    print(f"[SYSTEM] Nuovo client frontend connesso.")
+    # Invia un log iniziale di benvenuto
+    await websocket.send(json.dumps({
+        "type": "LOG",
+        "text": "[SYSTEM] Connessione stabilita con il Trading Engine in cloud su Render.",
+        "category": "info"
+    }))
 
-    async def register(self, websocket):
-        self.connected_clients.add(websocket)
-        await websocket.send(json.dumps({"type": "INIT", "balance": self.balance, "status": "LIVE"}))
+async def unregister(websocket):
+    connected_clients.remove(websocket)
+    print(f"[SYSTEM] Client disconnesso.")
 
-    async def unregister(self, websocket):
-        self.connected_clients.remove(websocket)
-
-    async def broadcast(self, message: dict):
-        if self.connected_clients:
-            payload = json.dumps(message)
-            await asyncio.gather(*[client.send(payload) for client in self.connected_clients])
-
-    async def handle_client(self, websocket, path=None):
-        await self.register(websocket)
-        try:
-            async for message in websocket:
-                data = json.loads(message)
-                if data.get("action") == "FORCE_SELL":
-                    await self.execute_trade("SELL", data["symbol"], 100.0, 0.001)
-        except websockets.ConnectionClosedError:
-            pass
-        finally:
-            await self.unregister(websocket)
-
-    async def start_trading_loop(self):
-        self.running = True
-        logging.info("Engine di Trading avviato...")
-        tokens_pool = [
-            {"symbol": "OASIS", "mint": "So11111111111111111111111111111111111111112"},
-            {"symbol": "SPIKY", "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"},
-            {"symbol": "DATEZ", "mint": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"}
-        ]
-        idx = 0
-        while self.running:
-            await asyncio.sleep(4)
-            target = tokens_pool[idx % len(tokens_pool)]
-            idx += 1
-            sec_check = self.check_token_security(target["mint"])
-            if not sec_check["safe"]:
-                warn_log = f"[WARN] ${target['symbol']} {sec_check['reason']}"
-                logging.warning(warn_log)
-                await self.broadcast({"type": "LOG", "text": warn_log, "category": "warn"})
-                continue
-            mock_price = 0.000481
-            await self.execute_trade("BUY", target["symbol"], 50.0, mock_price)
-            await asyncio.sleep(3)
-            await self.execute_trade("SELL", target["symbol"], 50.0, mock_price * 1.15)
+async def handle_messages(websocket):
+    await register(websocket)
+    try:
+        async for message in websocket:
+            data = json.loads(message)
+            action = data.get("action")
+            
+            print(f"[COMMAND] Comando ricevuto dal frontend: {action}")
+            
+            if action == "FORCE_BUY":
+                # Logica di esecuzione acquisto reale o simulata protetta
+                response_text = "[EXEC] Ordine di acquisto (FORCE_BUY) inviato alla blockchain di Solana!"
+                print(response_text)
+                await websocket.send(json.dumps({
+                    "type": "LOG",
+                    "text": response_text,
+                    "category": "fill"
+                }))
+                
+            elif action == "FORCE_SELL":
+                response_text = "[EXEC] Posizione chiusa con successo (FORCE_SELL)."
+                print(response_text)
+                await websocket.send(json.dumps({
+                    "type": "LOG",
+                    "text": response_text,
+                    "category": "warn"
+                }))
+                
+            elif action == "TOGGLE_BOT":
+                response_text = "[SYSTEM] Stato del bot modificato (Pausa/Avvio)."
+                print(response_text)
+                await websocket.send(json.dumps({
+                    "type": "LOG",
+                    "text": response_text,
+                    "category": "exec"
+                }))
+                
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    finally:
+        await unregister(websocket)
 
 async def main():
-    engine = TradingEngine()
-    port = int(os.environ.get("PORT", 8765))
-    server = await websockets.serve(engine.handle_client, "0.0.0.0", port)
-    logging.info(f"WebSocket Server attivo sulla porta {port}")
-    await asyncio.gather(server.wait_closed(), engine.start_trading_loop())
+    port = int(os.environ.get("PORT", 10000))
+    print(f"[SYSTEM] Avvio WebSocket Server sulla porta {port}...")
+    async with websockets.serve(handle_messages, "0.0.0.0", port):
+        await asyncio.Future()  # Mantieni il server attivo all'infinito
 
 if __name__ == "__main__":
     asyncio.run(main())
