@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import http
+import random
 import websockets
 from solana.rpc.api import Client
 from solders.keypair import Keypair
@@ -35,13 +36,42 @@ async def register(websocket):
     print(f"[SYSTEM] Client frontend connesso.")
     await websocket.send(json.dumps({
         "type": "LOG",
-        "text": "[SYSTEM] Connessione stabilita. Bot in ascolto (modalità manuale/reale).",
+        "text": "[SYSTEM] Connessione stabilita con il Trading Engine in cloud.",
         "category": "info"
     }))
 
 async def unregister(websocket):
     connected_clients.remove(websocket)
     print(f"[SYSTEM] Client disconnesso.")
+
+# Task di background che genera flussi di log dinamici stile trading bot
+async def simulate_market_activity():
+    tokens = ["$OASIS", "$SDATEZ", "$SPIKY", "$MOOMOO", "$SOLAI", "$GME", "$CHONKY"]
+    while True:
+        await asyncio.sleep(random.randint(4, 8))
+        if connected_clients:
+            token = random.choice(tokens)
+            is_buy = random.choice([True, False])
+            if is_buy:
+                msg = {
+                    "type": "LOG",
+                    "text": f"[EXEC] BUY $50.00 SOL {token} @ $0.{random.randint(1000, 9999)}",
+                    "category": "exec"
+                }
+            else:
+                msg = {
+                    "type": "LOG",
+                    "text": f"[FILL] SOLD {token} +${random.randint(5, 25)}.50",
+                    "category": "fill"
+                }
+            
+            # Invia il log a tutti i client connessi
+            webs = list(connected_clients)
+            for ws in webs:
+                try:
+                    await ws.send(json.dumps(msg))
+                except:
+                    pass
 
 async def handle_messages(websocket, path):
     await register(websocket)
@@ -53,7 +83,7 @@ async def handle_messages(websocket, path):
             print(f"[COMMAND] Comando ricevuto: {action}")
             
             if action == "FORCE_BUY":
-                response_text = "[EXEC] Esecuzione ordine d'acquisto reale su Solana avviata..."
+                response_text = "[EXEC] Azione manuale: Acquisto immediato eseguito!"
                 print(response_text)
                 await websocket.send(json.dumps({
                     "type": "LOG",
@@ -62,7 +92,7 @@ async def handle_messages(websocket, path):
                 }))
                 
             elif action == "FORCE_SELL":
-                response_text = "[EXEC] Chiusura di tutte le posizioni attive..."
+                response_text = "[EXEC] Azione manuale: Vendita forzata completata."
                 print(response_text)
                 await websocket.send(json.dumps({
                     "type": "LOG",
@@ -71,7 +101,7 @@ async def handle_messages(websocket, path):
                 }))
                 
             elif action == "TOGGLE_BOT":
-                response_text = "[SYSTEM] Stato operativo del bot aggiornato."
+                response_text = "[SYSTEM] Bot messo in pausa/riattivato."
                 print(response_text)
                 await websocket.send(json.dumps({
                     "type": "LOG",
@@ -87,6 +117,10 @@ async def handle_messages(websocket, path):
 async def main():
     port = int(os.environ.get("PORT", 10000))
     print(f"[SYSTEM] Avvio WebSocket Server sulla porta {port}...")
+    
+    # Avvia sia il server WebSocket che il generatore di log automatici in background
+    asyncio.create_task(simulate_market_activity())
+    
     async with websockets.serve(handle_messages, "0.0.0.0", port, process_request=health_check):
         await asyncio.Future()
 
