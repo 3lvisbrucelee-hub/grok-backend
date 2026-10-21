@@ -8,8 +8,6 @@ from flask_cors import CORS
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util import Retry
 
 app = Flask(__name__)
 CORS(app)
@@ -22,21 +20,6 @@ TRADE_AMOUNT_SOL = 0.005  # Quantità di SOL per lo swap reale
 is_bot_running = True
 last_logs = []
 active_positions = []
-
-def get_http_session():
-    """Crea una sessione HTTP con retry e fallback per superare i blocchi di rete di Render."""
-    session = requests.Session()
-    retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retries)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-        "Origin": "https://jup.ag",
-        "Referer": "https://jup.ag/"
-    })
-    return session
 
 def add_bot_log(msg, category="info"):
     global last_logs
@@ -96,8 +79,7 @@ def execute_trade():
         if not kp:
             return jsonify({"success": False, "message": "Chiave privata non valida"}), 400
 
-        add_bot_log("[SNIPER] Connessione agli aggregatori via sessione bypass...", "exec")
-        session = get_http_session()
+        add_bot_log("[SNIPER] Richiesta quote ed auto-creazione token account...", "exec")
         
         try:
             sender_pubkey = str(kp.pubkey())
@@ -105,59 +87,51 @@ def execute_trade():
             output_mint = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"  # BONK
             amount_lamports = int(TRADE_AMOUNT_SOL * 1e9)
 
-            # 1. Calcolo del preventivo via Jupiter API v6 con sessione avanzata
-            quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=500"
-            
-            quote_resp = None
-            try:
-                quote_resp = session.get(quote_url, timeout=8)
-            except Exception as net_err:
-                add_bot_log(f"[NET_WARN] Tentativo primario fallito, provo endpoint alternativo...", "warn")
-                # Fallback su endpoint swap diretto Raydium
-                raydium_url = f"https://transaction-v1.raydium.io/compute/swap-base-in?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=500&txVersion=V0"
-                quote_resp = session.get(raydium_url, timeout=10)
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept": "application/json"
+            }
 
-            if not quote_resp or quote_resp.status_code != 200:
-                err_text = quote_resp.text if quote_resp else "Nessuna risposta dalla rete"
-                add_bot_log(f"[API_ERR] Errore di rete/DNS su Render: {err_text[:100]}", "warn")
-                return jsonify({"success": False, "message": "Impossibile contattare i DEX da Render"}), 400
+            # 1. Quote
+            quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=1000"
+            quote_resp = requests.get(quote_url, headers=headers, timeout=10)
+
+            if quote_resp.status_code != 200:
+                add_bot_log(f"[QUOTE_ERR] Status {quote_resp.status_code}: {quote_resp.text[:80]}", "warn")
+                return jsonify({"success": False, "message": "Errore nel preventivo di scambio"}), 400
 
             quote_json = quote_resp.json()
-            add_bot_log("[DEX] Preventivo ottenuto con successo! Generazione transazione...", "info")
 
-            # 2. Richiesta transazione di swap assemblata
-            if "routePlan" in quote_json or "outAmount" in quote_json: # Risposta Jupiter
-                swap_payload = {
-                    "quoteResponse": quote_json,
-                    "userPublicKey": sender_pubkey,
-                    "wrapAndUnwrapSol": True,
-                    "dynamicComputeUnitLimit": True,
-                    "prioritizationFeeLamports": 100000
-                }
-                swap_resp = session.post("https://quote-api.jup.ag/v6/swap", json=swap_payload, timeout=10)
-                raw_tx_b64 = swap_resp.json().get("swapTransaction")
-            else: # Risposta Raydium
-                ray_data = quote_json.get("data")
-                swap_payload = {
-                    "computeUnitPriceMicroLamports": "150000",
-                    "swapResponse": ray_data,
-                    "userPublicKey": sender_pubkey,
-                    "wrapAndUnwrapSol": True
-                }
-                swap_resp = session.post("https://transaction-v1.raydium.io/transaction/swap-base-in", json=swap_payload, timeout=10)
-                raw_tx_b64 = swap_resp.json().get("data", [{}])[0].get("transaction")
+            # 2. Swap payload con auto-creazione ATA attivata
+            swap_payload = {
+                "quoteResponse": quote_json,
+                "userPublicKey": sender_pubkey,
+                "wrapAndUnwrapSol": True,
+                "autoCreateAssociatedTokenAccount": True,
+                "dynamicComputeUnitLimit": True,
+                "prioritizationFeeLamports": 150000
+            }
+            
+            swap_resp = requests.post("https://quote-api.jup.ag/v6/swap", json=swap_payload, headers=headers, timeout=10)
+            
+            if swap_resp.status_code != 200:
+                add_bot_log(f"[SWAP_ERR] Status {swap_resp.status_code}: {swap_resp.text[:80]}", "warn")
+                return jsonify({"success": False, "message": f"Errore Jupiter Swap: {swap_resp.text[:60]}"}), 400
+
+            raw_tx_b64 = swap_resp.json().get("swapTransaction")
 
             if not raw_tx_b64:
-                return jsonify({"success": False, "message": "Impossibile ottenere il pacchetto di transazione"}), 400
+                add_bot_log("[ERR] Nessuna transazione restituita dall'aggregatore", "warn")
+                return jsonify({"success": False, "message": "Transazione vuota"}), 400
 
-            # 3. Deserializzazione e firma crittografica della transazione Versioned (v0)
+            # 3. Deserializzazione e firma crittografica v0
             raw_tx_bytes = base64.b64decode(raw_tx_b64)
             versioned_tx = VersionedTransaction.from_bytes(raw_tx_bytes)
             
             signature = kp.sign_message(versioned_tx.message.to_bytes())
             signed_versioned_tx = VersionedTransaction(versioned_tx.message, [signature])
 
-            # 4. Spedizione diretta al nodo Helius privato
+            # 4. Spedizione diretta al nodo Helius
             signed_b64 = base64.b64encode(bytes(signed_versioned_tx)).decode('utf-8')
             rpc_payload = {
                 "jsonrpc": "2.0",
@@ -170,13 +144,13 @@ def execute_trade():
 
             if "result" in rpc_res:
                 tx_hash = rpc_res["result"]
-                add_bot_log(f"[SUCCESS] SWAP REALE COMPLETATO SU RENDER! SOL -> MEMECOIN. Tx: {tx_hash[:16]}...", "fill")
+                add_bot_log(f"[SUCCESS] SWAP COMPLETATO! Tx: {tx_hash[:16]}...", "fill")
                 
                 new_pos = {
                     "id": tx_hash[:8],
                     "token": "BONK / SOL",
                     "invested": f"{TRADE_AMOUNT_SOL} SOL",
-                    "target": "2x Profitto",
+                    "target": "2x Target",
                     "status": "COMPRATA (On-Chain)",
                     "time": time.strftime("%H:%M:%S")
                 }
