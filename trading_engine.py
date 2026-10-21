@@ -6,8 +6,7 @@ import base64
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from solders.keypair import Keypair
-from solders.transaction import Transaction
-from solders.hash import Hash
+from solders.transaction import VersionedTransaction
 import requests
 
 app = Flask(__name__)
@@ -16,7 +15,7 @@ CORS(app)
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 
-TRADE_AMOUNT_SOL = 0.005  # 0.005 SOL per acquisto memecoin
+TRADE_AMOUNT_SOL = 0.005  # 0.005 SOL per l'acquisto della memecoin
 
 is_bot_running = True
 last_logs = []
@@ -46,7 +45,7 @@ def get_keypair():
 def health_check():
     kp = get_keypair()
     pubkey = str(kp.pubkey()) if kp else "NON_VALIDO"
-    return jsonify({"status": "Raydium Direct Engine Active", "wallet": pubkey}), 200
+    return jsonify({"status": "Raydium Real Swap Engine", "wallet": pubkey}), 200
 
 @app.route("/api/balance", methods=["GET"])
 def get_balance():
@@ -80,90 +79,87 @@ def execute_trade():
         if not kp:
             return jsonify({"success": False, "message": "Chiave privata non valida"}), 400
 
-        add_bot_log("[RAYDIUM] Connessione al Router Raydium V2...", "exec")
+        add_bot_log("[RAYDIUM] Avvio procedura SWAP memecoin reale...", "exec")
         
         try:
             sender_pubkey = str(kp.pubkey())
-            input_mint = "So11111111111111111111111111111111111111112"   # SOL
-            output_mint = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"  # BONK (o token sniper)
+            input_mint = "So11111111111111111111111111111111111111112"   # Native SOL
+            output_mint = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"  # BONK Mint Address
             amount_lamports = int(TRADE_AMOUNT_SOL * 1e9)
 
-            # 1. Richiesta Quote diretta all'API di Raydium
-            raydium_quote_url = f"https://transaction-v1.raydium.io/compute/swap-base-in?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=300&txVersion=V0"
+            # 1. Preventivo Swap da Raydium API v2
+            raydium_quote_url = f"https://transaction-v1.raydium.io/compute/swap-base-in?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps=500&txVersion=V0"
             
             headers = {"User-Agent": "Mozilla/5.0"}
             quote_resp = requests.get(raydium_quote_url, headers=headers, timeout=10)
 
-            if quote_resp.status_code == 200 and quote_resp.json().get("success"):
-                quote_data = quote_resp.json().get("data")
-                add_bot_log("[RAYDIUM] Quote ottenuto. Generazione Swap Transaction...", "info")
+            if quote_resp.status_code != 200 or not quote_resp.json().get("success"):
+                err_msg = quote_resp.json().get("msg", "Impossibile calcolare il quote Raydium")
+                add_bot_log(f"[RAYDIUM_ERR] {err_msg}", "warn")
+                return jsonify({"success": False, "message": err_msg}), 400
 
-                # 2. Richiesta della transazione di Swap grezza da Raydium
-                swap_payload = {
-                    "computeUnitPriceMicroLamports": "100000",
-                    "swapResponse": quote_data,
-                    "userPublicKey": sender_pubkey,
-                    "wrapAndUnwrapSol": True
+            quote_data = quote_resp.json().get("data")
+            add_bot_log("[RAYDIUM] Quote calcolato. Creazione transazione di Swap v0...", "info")
+
+            # 2. Richiesta transazione di Swap assemblata da Raydium
+            swap_payload = {
+                "computeUnitPriceMicroLamports": "150000",
+                "swapResponse": quote_data,
+                "userPublicKey": sender_pubkey,
+                "wrapAndUnwrapSol": True
+            }
+            
+            swap_resp = requests.post("https://transaction-v1.raydium.io/transaction/swap-base-in", json=swap_payload, headers=headers, timeout=10)
+            
+            if swap_resp.status_code != 200 or not swap_resp.json().get("success"):
+                err_msg = "Fallimento generazione transazione Swap Raydium"
+                add_bot_log(f"[RAYDIUM_ERR] {err_msg}", "warn")
+                return jsonify({"success": False, "message": err_msg}), 400
+
+            tx_list = swap_resp.json().get("data", [])
+            if not tx_list:
+                return jsonify({"success": False, "message": "Nessuna transazione restituita da Raydium"}), 400
+
+            raw_tx_b64 = tx_list[0].get("transaction")
+            
+            # 3. Deserializzazione ed esecuzione firma della transazione Versioned (v0)
+            raw_tx_bytes = base64.b64decode(raw_tx_b64)
+            versioned_tx = VersionedTransaction.from_bytes(raw_tx_bytes)
+            
+            # Firma con la tua Keypair
+            signature = kp.sign_message(versioned_tx.message.to_bytes())
+            signed_versioned_tx = VersionedTransaction(versioned_tx.message, [signature])
+
+            # 4. Spedizione della transazione firmata al nodo Helius
+            signed_b64 = base64.b64encode(bytes(signed_versioned_tx)).decode('utf-8')
+            rpc_payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "sendTransaction",
+                "params": [signed_b64, {"encoding": "base64", "maxRetries": 3, "skipPreflight": False}]
+            }
+            
+            rpc_res = requests.post(SOLANA_RPC_URL, json=rpc_payload, timeout=20).json()
+
+            if "result" in rpc_res:
+                tx_hash = rpc_res["result"]
+                add_bot_log(f"[SUCCESS] SWAP REALE COMPLETO! SOL -> MEMECOIN. Tx: {tx_hash[:16]}...", "fill")
+                
+                new_pos = {
+                    "id": tx_hash[:8],
+                    "token": "BONK / SOL (Raydium)",
+                    "invested": f"{TRADE_AMOUNT_SOL} SOL",
+                    "target": "2x Target",
+                    "status": "COMPRATA (On-Chain)",
+                    "time": time.strftime("%H:%M:%S")
                 }
-                
-                swap_resp = requests.post("https://transaction-v1.raydium.io/transaction/swap-base-in", json=swap_payload, headers=headers, timeout=10)
-                
-                if swap_resp.status_code == 200 and swap_resp.json().get("success"):
-                    tx_data = swap_resp.json().get("data", [])
-                    if len(tx_data) > 0:
-                        raw_tx_b64 = tx_data[0].get("transaction")
-                        
-                        # 3. Firma crittografica Ed25519 con la libreria Solders
-                        tx_bytes = bytearray(base64.b64decode(raw_tx_b64))
-                        num_signatures = tx_bytes[0]
-                        msg_offset = 1 + (num_signatures * 64)
-                        message_bytes = bytes(tx_bytes[msg_offset:])
-                        
-                        signature = kp.sign_message(message_bytes)
-                        tx_bytes[1:65] = signature
-                        signed_tx_b64 = base64.b64encode(bytes(tx_bytes)).decode('utf-8')
+                active_positions.append(new_pos)
 
-                        # 4. Spedizione diretta al nodo Helius privato
-                        rpc_res = requests.post(SOLANA_RPC_URL, json={
-                            "jsonrpc": "2.0", "id": 1, "method": "sendTransaction",
-                            "params": [signed_tx_b64, {"encoding": "base64", "skipPreflight": False}]
-                        }, timeout=20).json()
-
-                        if "result" in rpc_res:
-                            tx_hash = rpc_res["result"]
-                            add_bot_log(f"[SUCCESS] ACQUISTO RAYDIUM ESEGUITO! Tx: {tx_hash[:12]}...", "fill")
-                            
-                            new_pos = {
-                                "id": tx_hash[:8],
-                                "token": "BONK/SOL (Raydium)",
-                                "invested": f"{TRADE_AMOUNT_SOL} SOL",
-                                "target": "2x Profitto",
-                                "status": "ATTIVA (Raydium)",
-                                "time": time.strftime("%H:%M:%S")
-                            }
-                            active_positions.append(new_pos)
-
-                            return jsonify({"success": True, "message": f"Acquisto riuscito! Tx: {tx_hash[:8]}"}), 200
-
-            # Fallback Raydium On-Chain Direct Routing via Helius
-            add_bot_log("[RAYDIUM] Inoltro diretto della richiesta via Helius RPC...", "info")
-            bh_resp = requests.post(SOLANA_RPC_URL, json={
-                "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash", "params": [{"commitment": "finalized"}]
-            }, timeout=10).json()
-            bh_str = bh_resp.get("result", {}).get("value", {}).get("blockhash")
-
-            from solders.system_program import transfer, TransferParams
-            instruction = transfer(TransferParams(from_pubkey=kp.pubkey(), to_pubkey=kp.pubkey(), lamports=amount_lamports))
-            tx = Transaction.new_signed_with_payer([instruction], kp.pubkey(), [kp], Hash.from_string(bh_str))
-
-            tx_b64 = base64.b64encode(bytes(tx)).decode('utf-8')
-            rpc_res = requests.post(SOLANA_RPC_URL, json={
-                "jsonrpc": "2.0", "id": 1, "method": "sendTransaction", "params": [tx_b64, {"encoding": "base64"}]
-            }, timeout=20).json()
-
-            tx_hash = rpc_res.get("result", "TX_OK")
-            add_bot_log(f"[SUCCESS] Transazione Raydium confermata! Tx: {tx_hash[:10]}", "fill")
-            return jsonify({"success": True, "message": f"Ordine Raydium confermato! Tx: {tx_hash[:8]}"}), 200
+                return jsonify({"success": True, "message": f"Memecoin acquistata su Raydium! Tx: {tx_hash[:8]}"}), 200
+            else:
+                err_desc = rpc_res.get("error", {})
+                add_bot_log(f"[RPC_ERR] Swap rifiutato da Solana: {err_desc}", "warn")
+                return jsonify({"success": False, "message": f"Errore Swap: {err_desc}"}), 400
 
         except Exception as e:
             add_bot_log(f"[CRITICAL] {str(e)}", "warn")
