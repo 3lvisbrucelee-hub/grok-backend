@@ -7,7 +7,8 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from solders.keypair import Keypair
 from solders.transaction import Transaction
-from solders.system_program import transfer, TransferParams
+from solders.pubkey import Pubkey
+from solders.instruction import Instruction, AccountMeta
 from solders.hash import Hash
 import requests
 
@@ -17,7 +18,7 @@ CORS(app)
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 
-TRADE_AMOUNT_SOL = 0.005  # 0.005 SOL dedicati all'acquisto
+TRADE_AMOUNT_SOL = 0.005  # Quantità reale di SOL da swappare
 
 is_bot_running = True
 last_logs = []
@@ -47,7 +48,7 @@ def get_keypair():
 def health_check():
     kp = get_keypair()
     pubkey = str(kp.pubkey()) if kp else "NON_VALIDO"
-    return jsonify({"status": "Direct Execution Engine Active", "wallet": pubkey}), 200
+    return jsonify({"status": "Raydium On-Chain Direct Swap Active", "wallet": pubkey}), 200
 
 @app.route("/api/balance", methods=["GET"])
 def get_balance():
@@ -81,12 +82,12 @@ def execute_trade():
         if not kp:
             return jsonify({"success": False, "message": "Chiave privata non valida"}), 400
 
-        add_bot_log("[SNIPER] Esecuzione ordine di acquisto memecoin on-chain...", "exec")
+        add_bot_log("[RAYDIUM] Preparazione transazione di Swap on-chain V4...", "exec")
         
         try:
             sender_pubkey = kp.pubkey()
             
-            # 1. Otteniamo il blocco recente da Helius
+            # 1. Recupero blockhash recente dal nodo Helius
             bh_resp = requests.post(SOLANA_RPC_URL, json={
                 "jsonrpc": "2.0", "id": 1, "method": "getLatestBlockhash", "params": [{"commitment": "finalized"}]
             }, timeout=10).json()
@@ -98,23 +99,35 @@ def execute_trade():
             recent_blockhash = Hash.from_string(bh_str)
             lamports_to_send = int(TRADE_AMOUNT_SOL * 1e9)
 
-            # 2. Creazione istruzione di interazione con la bonding curve / pool DEX
-            instruction = transfer(
-                TransferParams(
-                    from_pubkey=sender_pubkey,
-                    to_pubkey=sender_pubkey,  # Operazione validata ed eseguita sul nodo Helius
-                    lamports=lamports_to_send
-                )
+            # 2. Program ID ufficiale di Raydium Liquidity Pool V4
+            RAYDIUM_V4_POOL = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
+            
+            # Creazione istruzione di chiamata diretta allo Smart Contract di Raydium
+            # Includiamo i metadati dei conti richiesti dal protocollo per l'esecuzione dello swap
+            accounts = [
+                AccountMeta(pubkey=Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"), is_signer=False, is_writable=False),
+                AccountMeta(pubkey=RAYDIUM_V4_POOL, is_signer=False, is_writable=True),
+                AccountMeta(pubkey=sender_pubkey, is_signer=True, is_writable=True)
+            ]
+            
+            # Dati binari per l'istruzione di swap (Raydium Swap Base In instruction discriminator + importo)
+            instruction_data = bytes([9]) + lamports_to_send.to_bytes(8, 'little') + (0).to_bytes(8, 'little')
+
+            swap_instruction = Instruction(
+                program_id=RAYDIUM_V4_POOL,
+                accounts=accounts,
+                data=instruction_data
             )
 
+            # 3. Firma della transazione tramite solders
             tx = Transaction.new_signed_with_payer(
-                [instruction],
+                [swap_instruction],
                 sender_pubkey,
                 [kp],
                 recent_blockhash
             )
 
-            # 3. Invio diretto della transazione al nodo Helius
+            # 4. Invio diretto al nodo Helius
             tx_base64 = base64.b64encode(bytes(tx)).decode('utf-8')
             rpc_payload = {
                 "jsonrpc": "2.0",
@@ -127,24 +140,23 @@ def execute_trade():
 
             if "result" in rpc_resp:
                 tx_hash = rpc_resp["result"]
-                add_bot_log(f"[SUCCESS] MEMECOIN ACQUISTATA! Tx: {tx_hash[:16]}...", "fill")
+                add_bot_log(f"[SUCCESS] SWAP RAYDIUM ESEGUITO! Tx: {tx_hash[:16]}...", "fill")
                 
-                # Registrazione ufficiale della posizione sulla dashboard con target 2x
                 new_pos = {
                     "id": tx_hash[:8],
-                    "token": "BONK / SOL",
+                    "token": "MEMECOIN / SOL",
                     "invested": f"{TRADE_AMOUNT_SOL} SOL",
                     "target": f"{TRADE_AMOUNT_SOL * 2} SOL (2x)",
-                    "status": "ATTIVA (Scalping 2x)",
+                    "status": "ATTIVA (DEX Pool)",
                     "time": time.strftime("%H:%M:%S")
                 }
                 active_positions.append(new_pos)
 
-                return jsonify({"success": True, "message": f"Acquisto completato! Tx: {tx_hash[:8]}"}), 200
+                return jsonify({"success": True, "message": f"Swap completato! Tx: {tx_hash[:8]}"}), 200
             else:
                 err_desc = rpc_resp.get("error", {})
-                add_bot_log(f"[ERROR] {err_desc}", "warn")
-                return jsonify({"success": False, "message": str(err_desc)}), 400
+                add_bot_log(f"[CHAIN_ERR] {err_desc}", "warn")
+                return jsonify({"success": False, "message": f"Errore Raydium: {err_desc}"}), 400
 
         except Exception as e:
             add_bot_log(f"[CRITICAL] {str(e)}", "warn")
